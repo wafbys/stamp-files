@@ -22,7 +22,7 @@ const (
 	dbFileName        = "stamp-db.txt"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 const usageText = `用法：
   stamp-files [选项] [目录]
@@ -32,6 +32,9 @@ const usageText = `用法：
 
 数据库格式：文件名|MD5|SHA1|SHA256
 MD5、SHA1、SHA256 任一命中即可，文件名不区分大小写。
+
+打戳、将打戳标签后的掩码表示要写的时间：C=创建，M=修改，L=访问；
+已经一致的位显示 -，例如 [打戳 CML]、[将打戳 -M-]。
 
 选项（区分大小写）：
   -t, --time <时间>        所有命中文件统一使用的时间
@@ -107,6 +110,7 @@ type fileResult struct {
 	rel    string
 	status status
 	detail string
+	mask   string
 	err    error
 }
 
@@ -470,11 +474,12 @@ func processFile(opts *options, db *database, fullPath, rel string) fileResult {
 	if !ok {
 		return fileResult{rel: rel, status: statusError, err: fmt.Errorf("无法读取文件时间戳")}
 	}
+	mask := times.stampMask(opts.stamp)
 	if times.equal(opts.stamp) {
 		return fileResult{rel: rel, status: statusAlready, detail: detail}
 	}
 	if opts.dryRun {
-		return fileResult{rel: rel, status: statusWouldStamp, detail: detail}
+		return fileResult{rel: rel, status: statusWouldStamp, detail: detail, mask: mask}
 	}
 	if err := of.setTimes(opts.stamp); err != nil {
 		return fileResult{rel: rel, status: statusError, err: err}
@@ -482,7 +487,7 @@ func processFile(opts *options, db *database, fullPath, rel string) fileResult {
 	if err := of.verifyTimes(opts.stamp); err != nil {
 		return fileResult{rel: rel, status: statusError, err: err}
 	}
-	return fileResult{rel: rel, status: statusStamped, detail: detail}
+	return fileResult{rel: rel, status: statusStamped, detail: detail, mask: mask}
 }
 
 func scan(opts *options, db *database, rep *reporter) summary {
@@ -522,10 +527,10 @@ func scan(opts *options, db *database, rep *reporter) summary {
 		switch res.status {
 		case statusStamped:
 			sum.stamped++
-			rep.stamped(res.rel, res.detail)
+			rep.stamped(res.rel, res.detail, res.mask)
 		case statusWouldStamp:
 			sum.stamped++
-			rep.wouldStamp(res.rel, res.detail)
+			rep.wouldStamp(res.rel, res.detail, res.mask)
 		case statusAlready:
 			sum.already++
 			rep.already(res.rel, res.detail)
@@ -832,12 +837,19 @@ func (r *reporter) paint(color bool, code, text string) string {
 	return code + text + "\x1b[0m"
 }
 
-func (r *reporter) stamped(rel, detail string) {
-	fmt.Fprintf(r.out, "%s %s  %s\n", r.paint(r.outColor, "\x1b[32m", "[打戳]"), rel, detail)
+func (r *reporter) stamped(rel, detail, mask string) {
+	fmt.Fprintf(r.out, "%s %s  %s\n", r.paint(r.outColor, "\x1b[32m", stampTag("打戳", mask)), rel, detail)
 }
 
-func (r *reporter) wouldStamp(rel, detail string) {
-	fmt.Fprintf(r.out, "%s %s  %s\n", r.paint(r.outColor, "\x1b[33m", "[将打戳]"), rel, detail)
+func (r *reporter) wouldStamp(rel, detail, mask string) {
+	fmt.Fprintf(r.out, "%s %s  %s\n", r.paint(r.outColor, "\x1b[33m", stampTag("将打戳", mask)), rel, detail)
+}
+
+func stampTag(verb, mask string) string {
+	if mask == "" {
+		return "[" + verb + "]"
+	}
+	return "[" + verb + " " + mask + "]"
 }
 
 func (r *reporter) already(rel, detail string) {

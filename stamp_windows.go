@@ -124,6 +124,22 @@ func (t fileTimes) equal(x time.Time) bool {
 	return t.creation.Equal(x) && t.access.Equal(x) && t.write.Equal(x)
 }
 
+// stampMask 返回三位掩码，顺序固定为创建、修改、访问：
+// 与目标时间不一致（需要写入）的位显示 C/M/L，已经一致的位显示 -。
+func (t fileTimes) stampMask(target time.Time) string {
+	b := [3]byte{'-', '-', '-'}
+	if !t.creation.Equal(target) {
+		b[0] = 'C'
+	}
+	if !t.write.Equal(target) {
+		b[1] = 'M'
+	}
+	if !t.access.Equal(target) {
+		b[2] = 'L'
+	}
+	return string(b[:])
+}
+
 func fileTimesFromInfo(info os.FileInfo) (fileTimes, bool) {
 	data, ok := info.Sys().(*syscall.Win32FileAttributeData)
 	if !ok {

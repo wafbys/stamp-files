@@ -25,8 +25,8 @@ func TestRunStampEndToEnd(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("dry-run exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "将打戳") {
-		t.Errorf("dry-run 输出缺少「将打戳」：%s", out.String())
+	if !strings.Contains(out.String(), "[将打戳 CML]") {
+		t.Errorf("dry-run 输出缺少「将打戳 CML」：%s", out.String())
 	}
 	assertTimesNotTarget(t, p)
 
@@ -36,8 +36,8 @@ func TestRunStampEndToEnd(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("stamp exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[打戳]") {
-		t.Errorf("输出缺少「打戳」：%s", out.String())
+	if !strings.Contains(out.String(), "[打戳 CML]") {
+		t.Errorf("输出缺少「打戳 CML」：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
 
@@ -53,6 +53,34 @@ func TestRunStampEndToEnd(t *testing.T) {
 		t.Errorf("第二次运行应显示「已一致」：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
+}
+
+func TestStampMask(t *testing.T) {
+	target := testTarget
+	off := target.Add(-time.Second)
+	mk := func(creation, write, access time.Time) fileTimes {
+		return fileTimes{creation: creation, write: write, access: access}
+	}
+	cases := []struct {
+		name  string
+		times fileTimes
+		want  string
+	}{
+		{"全部一致", mk(target, target, target), "---"},
+		{"全部不一致", mk(off, off, off), "CML"},
+		{"仅创建不一致", mk(off, target, target), "C--"},
+		{"仅修改不一致", mk(target, off, target), "-M-"},
+		{"仅访问不一致", mk(target, target, off), "--L"},
+		{"创建和访问不一致", mk(off, target, off), "C-L"},
+		{"创建和修改不一致", mk(off, off, target), "CM-"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.times.stampMask(target); got != c.want {
+				t.Errorf("stampMask = %q，期望 %q", got, c.want)
+			}
+		})
+	}
 }
 
 func TestRunTimeFlag(t *testing.T) {
@@ -81,7 +109,7 @@ func TestRunFilenameMatch(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[打戳]") {
+	if !strings.Contains(out.String(), "[打戳 ") {
 		t.Errorf("应按文件名命中：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
@@ -134,7 +162,7 @@ func TestRunUnicodePath(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[打戳]") {
+	if !strings.Contains(out.String(), "[打戳 ") {
 		t.Errorf("中文路径应打戳：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
@@ -159,7 +187,7 @@ func TestRunLongPath(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[打戳]") {
+	if !strings.Contains(out.String(), "[打戳 ") {
 		t.Errorf("长路径应打戳：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
@@ -180,7 +208,7 @@ func TestRunReadOnlyFile(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[打戳]") {
+	if !strings.Contains(out.String(), "[打戳 ") {
 		t.Errorf("只读文件应能打戳：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
@@ -301,7 +329,7 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if code := run([]string{"-V"}, &out, &errOut); code != 0 {
 		t.Fatalf("version exit = %d", code)
 	}
-	if !strings.Contains(out.String(), "stamp-files 0.2.0") {
+	if !strings.Contains(out.String(), "stamp-files 0.3.0") {
 		t.Errorf("版本输出不对：%s", out.String())
 	}
 
