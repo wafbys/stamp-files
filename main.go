@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,7 +24,7 @@ const (
 	dbFileName        = "stamp-db.txt"
 )
 
-var version = "0.3.1"
+var version = "0.4.0"
 
 const usageText = `用法：
   stamp-files [选项] [目录]
@@ -32,6 +34,7 @@ const usageText = `用法：
 
 数据库格式：文件名|MD5|SHA1|SHA256
 MD5、SHA1、SHA256 任一命中即可，文件名不区分大小写。
+--add 写入后按文件名（不区分大小写）排序，注释和空行保留在开头。
 
 打戳、将打戳标签后的掩码表示要写的时间：C=创建，M=修改；
 已经一致的位显示 -，例如 [打戳 CM]、[将打戳 -M]。
@@ -696,6 +699,12 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "错误：%v\n", writeErr)
 		return 2
 	}
+	if !opts.dryRun {
+		if err := sortDatabaseFile(opts.dbPath); err != nil {
+			fmt.Fprintf(stderr, "错误：排序数据库失败：%v\n", err)
+			return 2
+		}
+	}
 
 	printAddSummary(stdout, sum, opts.dryRun)
 	if sum.added > 0 {
@@ -715,6 +724,106 @@ func exitForErrors(n int) int {
 		return 1
 	}
 	return 0
+}
+
+type dbSortEntry struct {
+	key  string
+	line string
+}
+
+// sortDatabaseFile 按文件名（不区分大小写）重排数据库，注释和空行保留在开头。
+// 文件不存在或顺序未变时不改写；--add 的 dry-run 不调用本函数。
+func sortDatabaseFile(dbPath string) error {
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	bom := bytes.HasPrefix(data, []byte("\xEF\xBB\xBF"))
+	if bom {
+		data = data[3:]
+	}
+	text := string(data)
+	if text == "" {
+		return nil
+	}
+
+	lines := strings.Split(text, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+
+	entries := make([]dbSortEntry, len(lines))
+	for i, line := range lines {
+		entries[i] = dbSortEntry{key: dbSortKey(line), line: line}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].key < entries[j].key
+	})
+
+	changed := false
+	for i := range entries {
+		if entries[i].line != lines[i] {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil
+	}
+
+	eol := "\n"
+	if strings.Contains(text, "\r\n") {
+		eol = "\r\n"
+	}
+	var b strings.Builder
+	if bom {
+		b.WriteString("\uFEFF")
+	}
+	for _, e := range entries {
+		b.WriteString(e.line)
+		b.WriteString(eol)
+	}
+	return writeFileAtomic(dbPath, []byte(b.String()))
+}
+
+func dbSortKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return ""
+	}
+	name, _, _ := strings.Cut(line, "|")
+	return normalizeName(name)
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".stamp-db-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func printAddSummary(w io.Writer, s addSummary, dryRun bool) {

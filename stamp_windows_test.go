@@ -352,7 +352,7 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if code := run([]string{"-V"}, &out, &errOut); code != 0 {
 		t.Fatalf("version exit = %d", code)
 	}
-	if !strings.Contains(out.String(), "stamp-files 0.3.1") {
+	if !strings.Contains(out.String(), "stamp-files 0.4.0") {
 		t.Errorf("版本输出不对：%s", out.String())
 	}
 
@@ -642,6 +642,70 @@ func TestRunAddUnicode(t *testing.T) {
 	}
 }
 
+func TestRunAddSortsDatabase(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "alpha.txt", []byte("alpha"))
+	writeTestFile(t, root, "mid.txt", []byte("mid"))
+	db := writeTestDB(t, "# 注释\r\n\r\n"+
+		dbLine("zeta.txt", []byte("z"))+"\r\n"+
+		dbLine("Banana.txt", []byte("b"))+"\r\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--add", "--db", db, root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	got := readDBNames(t, db)
+	want := []string{"alpha.txt", "Banana.txt", "mid.txt", "zeta.txt"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("文件名顺序 = %v，期望 %v", got, want)
+	}
+	raw, err := os.ReadFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(raw), "# 注释\r\n\r\n") {
+		t.Errorf("注释和空行应保留在开头：%q", string(raw))
+	}
+}
+
+func TestRunAddSortsExistingDBWithoutAdditions(t *testing.T) {
+	root := t.TempDir()
+	db := writeTestDB(t, dbLine("zeta.txt", []byte("z"))+"\r\n"+
+		dbLine("alpha.txt", []byte("a"))+"\r\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--add", "--db", db, root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	got := readDBNames(t, db)
+	want := []string{"alpha.txt", "zeta.txt"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("文件名顺序 = %v，期望 %v", got, want)
+	}
+}
+
+func TestRunAddDryRunDoesNotSortDB(t *testing.T) {
+	root := t.TempDir()
+	original := dbLine("zeta.txt", []byte("z")) + "\r\n" +
+		dbLine("alpha.txt", []byte("a")) + "\r\n"
+	db := writeTestDB(t, original)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--add", "-n", "--db", db, root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	raw, err := os.ReadFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != original {
+		t.Errorf("dry-run 不应改写数据库：%q", string(raw))
+	}
+}
+
 func writeTestFile(t *testing.T, root, rel string, data []byte) string {
 	t.Helper()
 	p := filepath.Join(root, filepath.FromSlash(rel))
@@ -666,6 +730,27 @@ func writeTestDB(t *testing.T, content string) string {
 func dbLine(name string, data []byte) string {
 	m5, s1, s256 := hashTriple(data)
 	return fmt.Sprintf("%s|%s|%s|%s", filepath.ToSlash(name), strings.ToUpper(m5), strings.ToUpper(s1), strings.ToUpper(s256))
+}
+
+func readDBNames(t *testing.T, p string) []string {
+	t.Helper()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) > 0 {
+			names = append(names, parts[0])
+		}
+	}
+	return names
 }
 
 func setCreationWrite(t *testing.T, p string, target time.Time) {
