@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -25,8 +26,8 @@ func TestRunStampEndToEnd(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("dry-run exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[将打戳 CML]") {
-		t.Errorf("dry-run 输出缺少「将打戳 CML」：%s", out.String())
+	if !strings.Contains(out.String(), "[将打戳 CM]") {
+		t.Errorf("dry-run 输出缺少「将打戳 CM」：%s", out.String())
 	}
 	assertTimesNotTarget(t, p)
 
@@ -36,8 +37,8 @@ func TestRunStampEndToEnd(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("stamp exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[打戳 CML]") {
-		t.Errorf("输出缺少「打戳 CML」：%s", out.String())
+	if !strings.Contains(out.String(), "[打戳 CM]") {
+		t.Errorf("输出缺少「打戳 CM」：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
 
@@ -66,13 +67,11 @@ func TestStampMask(t *testing.T) {
 		times fileTimes
 		want  string
 	}{
-		{"全部一致", mk(target, target, target), "---"},
-		{"全部不一致", mk(off, off, off), "CML"},
-		{"仅创建不一致", mk(off, target, target), "C--"},
-		{"仅修改不一致", mk(target, off, target), "-M-"},
-		{"仅访问不一致", mk(target, target, off), "--L"},
-		{"创建和访问不一致", mk(off, target, off), "C-L"},
-		{"创建和修改不一致", mk(off, off, target), "CM-"},
+		{"创建和修改都一致", mk(target, target, target), "--"},
+		{"创建和修改都不一致", mk(off, off, target), "CM"},
+		{"仅创建不一致", mk(off, target, target), "C-"},
+		{"仅修改不一致", mk(target, off, target), "-M"},
+		{"只有访问不一致", mk(target, target, off), "--"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -80,6 +79,30 @@ func TestStampMask(t *testing.T) {
 				t.Errorf("stampMask = %q，期望 %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestRunIgnoresAccessTime(t *testing.T) {
+	root := t.TempDir()
+	data := []byte("ignore atime")
+	p := writeTestFile(t, root, "a.txt", data)
+	setCreationWrite(t, p, testTarget)
+	db := writeTestDB(t, dbLine("a.txt", data)+"\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--db", db, root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "[已一致]") {
+		t.Errorf("创建和修改一致时应显示「已一致」：%s", out.String())
+	}
+	got := readTimes(t, p)
+	if !got.creation.Equal(testTarget) || !got.write.Equal(testTarget) {
+		t.Errorf("创建/修改时间不应再写：%s", formatTimes(got))
+	}
+	if got.access.Equal(testTarget) {
+		t.Errorf("访问时间不应被写入：%s", formatTimes(got))
 	}
 }
 
@@ -329,7 +352,7 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if code := run([]string{"-V"}, &out, &errOut); code != 0 {
 		t.Fatalf("version exit = %d", code)
 	}
-	if !strings.Contains(out.String(), "stamp-files 0.3.0") {
+	if !strings.Contains(out.String(), "stamp-files 0.3.1") {
 		t.Errorf("版本输出不对：%s", out.String())
 	}
 
@@ -643,6 +666,32 @@ func writeTestDB(t *testing.T, content string) string {
 func dbLine(name string, data []byte) string {
 	m5, s1, s256 := hashTriple(data)
 	return fmt.Sprintf("%s|%s|%s|%s", filepath.ToSlash(name), strings.ToUpper(m5), strings.ToUpper(s1), strings.ToUpper(s256))
+}
+
+func setCreationWrite(t *testing.T, p string, target time.Time) {
+	t.Helper()
+	ptr, err := syscall.UTF16PtrFromString(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := syscall.CreateFile(
+		ptr,
+		syscall.FILE_WRITE_ATTRIBUTES,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
+		nil,
+		syscall.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.CloseHandle(h)
+
+	ft := syscall.NsecToFiletime(target.UnixNano())
+	if err := syscall.SetFileTime(h, &ft, nil, &ft); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func readTimes(t *testing.T, p string) fileTimes {

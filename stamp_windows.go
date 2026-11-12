@@ -104,10 +104,9 @@ func (o *openedFile) verifyTimes(t time.Time) error {
 	if !ok {
 		return fmt.Errorf("回读时间戳失败：系统未返回 Win32 文件时间")
 	}
-	if !got.equal(t) {
-		return fmt.Errorf("时间戳回读不一致：创建=%s 访问=%s 修改=%s，期望=%s",
+	if !got.stampEqual(t) {
+		return fmt.Errorf("时间戳回读不一致：创建=%s 修改=%s，期望=%s（访问时间不校验）",
 			got.creation.Format(timeLayout),
-			got.access.Format(timeLayout),
 			got.write.Format(timeLayout),
 			t.Format(timeLayout))
 	}
@@ -124,18 +123,20 @@ func (t fileTimes) equal(x time.Time) bool {
 	return t.creation.Equal(x) && t.access.Equal(x) && t.write.Equal(x)
 }
 
-// stampMask 返回三位掩码，顺序固定为创建、修改、访问：
-// 与目标时间不一致（需要写入）的位显示 C/M/L，已经一致的位显示 -。
+// stampEqual 只比较创建和修改时间；访问时间由系统按读取策略更新，不参与判定。
+func (t fileTimes) stampEqual(target time.Time) bool {
+	return t.creation.Equal(target) && t.write.Equal(target)
+}
+
+// stampMask 返回两位掩码，顺序固定为创建、修改：
+// 与目标时间不一致（需要写入）的位显示 C/M，已经一致的位显示 -。
 func (t fileTimes) stampMask(target time.Time) string {
-	b := [3]byte{'-', '-', '-'}
+	b := [2]byte{'-', '-'}
 	if !t.creation.Equal(target) {
 		b[0] = 'C'
 	}
 	if !t.write.Equal(target) {
 		b[1] = 'M'
-	}
-	if !t.access.Equal(target) {
-		b[2] = 'L'
 	}
 	return string(b[:])
 }

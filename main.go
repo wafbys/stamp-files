@@ -22,7 +22,7 @@ const (
 	dbFileName        = "stamp-db.txt"
 )
 
-var version = "0.3.0"
+var version = "0.3.1"
 
 const usageText = `用法：
   stamp-files [选项] [目录]
@@ -33,8 +33,9 @@ const usageText = `用法：
 数据库格式：文件名|MD5|SHA1|SHA256
 MD5、SHA1、SHA256 任一命中即可，文件名不区分大小写。
 
-打戳、将打戳标签后的掩码表示要写的时间：C=创建，M=修改，L=访问；
-已经一致的位显示 -，例如 [打戳 CML]、[将打戳 -M-]。
+打戳、将打戳标签后的掩码表示要写的时间：C=创建，M=修改；
+已经一致的位显示 -，例如 [打戳 CM]、[将打戳 -M]。
+访问时间不参与判定。
 
 选项（区分大小写）：
   -t, --time <时间>        所有命中文件统一使用的时间
@@ -475,7 +476,7 @@ func processFile(opts *options, db *database, fullPath, rel string) fileResult {
 		return fileResult{rel: rel, status: statusError, err: fmt.Errorf("无法读取文件时间戳")}
 	}
 	mask := times.stampMask(opts.stamp)
-	if times.equal(opts.stamp) {
+	if times.stampEqual(opts.stamp) {
 		return fileResult{rel: rel, status: statusAlready, detail: detail}
 	}
 	if opts.dryRun {
