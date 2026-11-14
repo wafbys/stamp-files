@@ -3,28 +3,28 @@
 package main
 
 import (
-	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 type openedFile struct {
 	f      *os.File
-	md5    string
 	sha1   string
 	sha256 string
 	info   os.FileInfo
 }
 
-func openAndHash(filePath string) (*openedFile, error) {
+func openAndHash(filePath string, prog *progressPrinter) (*openedFile, error) {
 	p, err := syscall.UTF16PtrFromString(win32Path(filePath))
 	if err != nil {
 		return nil, fmt.Errorf("路径编码失败：%w", err)
@@ -67,20 +67,44 @@ func openAndHash(filePath string) (*openedFile, error) {
 		return nil, fmt.Errorf("读取文件信息失败：%w", err)
 	}
 
-	md5Hash := md5.New()
+	var src io.Reader = f
+	if prog != nil && prog.begin(filepath.Base(filePath), info.Size()) {
+		defer prog.end()
+		src = &progressReader{r: f, p: prog}
+	}
+
 	sha1Hash := sha1.New()
 	sha256Hash := sha256.New()
 	buf := make([]byte, 1<<20)
-	if _, err := io.CopyBuffer(io.MultiWriter(md5Hash, sha1Hash, sha256Hash), f, buf); err != nil {
+	hashes := &parallelHashWriter{hashes: []hash.Hash{sha1Hash, sha256Hash}}
+	if _, err := io.CopyBuffer(hashes, src, buf); err != nil {
 		return nil, fmt.Errorf("读取文件失败：%w", err)
 	}
 
-	of.md5 = hex.EncodeToString(md5Hash.Sum(nil))
 	of.sha1 = hex.EncodeToString(sha1Hash.Sum(nil))
 	of.sha256 = hex.EncodeToString(sha256Hash.Sum(nil))
 	of.info = info
 	ok = true
 	return of, nil
+}
+
+// parallelHashWriter 把同一块数据并发喂给多个哈希。
+// Write 返回前等待全部哈希完成，调用方可以安全复用缓冲区。
+type parallelHashWriter struct {
+	hashes []hash.Hash
+}
+
+func (w *parallelHashWriter) Write(p []byte) (int, error) {
+	var wg sync.WaitGroup
+	wg.Add(len(w.hashes))
+	for _, h := range w.hashes {
+		go func(h hash.Hash) {
+			defer wg.Done()
+			_, _ = h.Write(p)
+		}(h)
+	}
+	wg.Wait()
+	return len(p), nil
 }
 
 func (o *openedFile) Close() error {

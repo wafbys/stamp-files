@@ -138,20 +138,188 @@ func TestRunFilenameMatch(t *testing.T) {
 	assertTimes(t, p, testTarget)
 }
 
-func TestRunMD5OnlyMatch(t *testing.T) {
+func TestRunHashesMultiChunkFile(t *testing.T) {
 	root := t.TempDir()
-	data := []byte("md5 only")
+	data := bytes.Repeat([]byte("0123456789abcdef"), 200000) // 3.2 MB，跨多个 1 MB 读取块
+	p := writeTestFile(t, root, "big.bin", data)
+	db := writeTestDB(t, dbLine("big.bin", data)+"\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"-n", "--db", db, root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "[将打戳 CM]") {
+		t.Errorf("并发哈希结果与数据库不一致：%s", out.String())
+	}
+	assertTimesNotTarget(t, p)
+}
+
+func TestOpenAndHashProgress(t *testing.T) {
+	root := t.TempDir()
+	data := bytes.Repeat([]byte("x"), 2<<20)
+	p := writeTestFile(t, root, "big.bin", data)
+
+	var buf bytes.Buffer
+	prog := newProgressPrinter(&buf, true)
+	prog.minSize = 0
+	prog.interval = 0
+
+	of, err := openAndHash(p, prog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer of.Close()
+	s1, s256 := hashPair(data)
+	if of.sha1 != s1 || of.sha256 != s256 {
+		t.Error("带进度时哈希结果不一致")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[读取]") || !strings.Contains(out, "big.bin") {
+		t.Errorf("应输出读取进度：%q", out)
+	}
+}
+
+func TestRunWildcardFiltersFiles(t *testing.T) {
+	root := t.TempDir()
+	files := map[string][]byte{
+		"a.flac":          []byte("a"),
+		"B.FLAC":          []byte("b"),
+		"sub/c.flac":      []byte("c"),
+		"sub/deep/d.flac": []byte("d"),
+		"e.mp3":           []byte("e"),
+		"sub/f.jpg":       []byte("f"),
+	}
+	paths := make(map[string]string, len(files))
+	var dbContent strings.Builder
+	for rel, data := range files {
+		paths[rel] = writeTestFile(t, root, rel, data)
+		dbContent.WriteString(dbLine(rel, data) + "\n")
+	}
+	db := writeTestDB(t, dbContent.String())
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--db", db, filepath.Join(root, "*.flac")}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "匹配：*.flac") {
+		t.Errorf("输出缺少匹配行：%s", out.String())
+	}
+	if !strings.Contains(out.String(), "共 4 个文件") {
+		t.Errorf("只应统计命中的 4 个文件：%s", out.String())
+	}
+	for _, rel := range []string{"a.flac", "B.FLAC", "sub/c.flac", "sub/deep/d.flac"} {
+		assertTimes(t, paths[rel], testTarget)
+	}
+	for _, rel := range []string{"e.mp3", "sub/f.jpg"} {
+		assertTimesNotTarget(t, paths[rel])
+	}
+}
+
+func TestRunWildcardQuestionMark(t *testing.T) {
+	root := t.TempDir()
+	ab := writeTestFile(t, root, "ab.flac", []byte("ab"))
+	c := writeTestFile(t, root, "c.flac", []byte("c"))
+	db := writeTestDB(t, dbLine("ab.flac", []byte("ab"))+"\n"+dbLine("c.flac", []byte("c"))+"\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--db", db, filepath.Join(root, "?.flac")}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "共 1 个文件") {
+		t.Errorf("? 应只匹配单字符文件名：%s", out.String())
+	}
+	assertTimes(t, c, testTarget)
+	assertTimesNotTarget(t, ab)
+}
+
+func TestRunWildcardSubdirectoryRoot(t *testing.T) {
+	root := t.TempDir()
+	top := writeTestFile(t, root, "a.flac", []byte("a"))
+	sub := writeTestFile(t, root, "sub/b.flac", []byte("b"))
+	deep := writeTestFile(t, root, "sub/deep/c.flac", []byte("c"))
+	db := writeTestDB(t, dbLine("a.flac", []byte("a"))+"\n"+
+		dbLine("b.flac", []byte("b"))+"\n"+
+		dbLine("c.flac", []byte("c"))+"\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--db", db, filepath.Join(root, "sub", "*.flac")}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "共 2 个文件") {
+		t.Errorf("目录部分应作为扫描根：%s", out.String())
+	}
+	assertTimes(t, sub, testTarget)
+	assertTimes(t, deep, testTarget)
+	assertTimesNotTarget(t, top)
+}
+
+func TestRunAddWildcardFilters(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", []byte("a"))
+	writeTestFile(t, root, "b.jpg", []byte("b"))
+	writeTestFile(t, root, "sub/c.txt", []byte("c"))
+	db := filepath.Join(t.TempDir(), dbFileName)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--add", "--db", db, filepath.Join(root, "*.txt")}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	got := readDBNames(t, db)
+	want := []string{"a.txt", "c.txt"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("--add 只应写入匹配文件，实际 %v，期望 %v", got, want)
+	}
+}
+
+func TestRunWildcardNoMatch(t *testing.T) {
+	root := t.TempDir()
+	p := writeTestFile(t, root, "a.txt", []byte("a"))
+	db := writeTestDB(t, dbLine("a.txt", []byte("a"))+"\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--db", db, filepath.Join(root, "*.jpg")}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "共 0 个文件") {
+		t.Errorf("没有匹配时应统计 0 个文件：%s", out.String())
+	}
+	if strings.Contains(out.String(), "[未找到]") {
+		t.Errorf("被通配符排除的文件不应报未找到：%s", out.String())
+	}
+	assertTimesNotTarget(t, p)
+}
+
+func TestRunWildcardInDirectoryRejected(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{`D:\2024*\*.jpg`}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("exit = %d，期望 2", code)
+	}
+	if !strings.Contains(errOut.String(), "通配符只支持文件名最后一段") {
+		t.Errorf("错误信息不对：%s", errOut.String())
+	}
+}
+
+func TestRunSHA1OnlyMatch(t *testing.T) {
+	root := t.TempDir()
+	data := []byte("sha1 only")
 	p := writeTestFile(t, root, "a.txt", data)
-	m5, _, _ := hashTriple(data)
-	db := writeTestDB(t, fmt.Sprintf("a.txt|%s||\n", strings.ToUpper(m5)))
+	s1, _ := hashPair(data)
+	db := writeTestDB(t, fmt.Sprintf("a.txt|%s|\n", strings.ToUpper(s1)))
 
 	var out, errOut bytes.Buffer
 	code := run([]string{"--db", db, root}, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "MD5 匹配") {
-		t.Errorf("应报告 MD5 匹配：%s", out.String())
+	if !strings.Contains(out.String(), "SHA1 匹配") {
+		t.Errorf("应报告 SHA1 匹配：%s", out.String())
 	}
 	assertTimes(t, p, testTarget)
 }
@@ -352,7 +520,7 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if code := run([]string{"-V"}, &out, &errOut); code != 0 {
 		t.Fatalf("version exit = %d", code)
 	}
-	if !strings.Contains(out.String(), "stamp-files 0.4.0") {
+	if !strings.Contains(out.String(), "stamp-files 0.8.0") {
 		t.Errorf("版本输出不对：%s", out.String())
 	}
 
@@ -393,6 +561,9 @@ func TestRunAddCreatesDB(t *testing.T) {
 	if !strings.Contains(out.String(), "已写入 2 条记录") {
 		t.Errorf("输出缺少写入提示：%s", out.String())
 	}
+	if !strings.Contains(out.String(), "用时：") {
+		t.Errorf("输出缺少用时：%s", out.String())
+	}
 
 	var warn bytes.Buffer
 	loaded, err := loadDatabase(db, &warn)
@@ -405,8 +576,22 @@ func TestRunAddCreatesDB(t *testing.T) {
 	if len(loaded.byName["a.txt"]) != 1 || len(loaded.byName["b.txt"]) != 1 {
 		t.Errorf("文件名记录不对：%+v", loaded.byName)
 	}
-	m5, s1, s256 := hashTriple(dataA)
-	if rec := loaded.byName["a.txt"][0]; !rec.matches(m5, s1, s256) {
+	raw, err := os.ReadFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		parts := strings.Split(strings.TrimSuffix(line, "\r"), "|")
+		if len(parts) != 4 {
+			t.Errorf("第 %d 行应为四字段（添加时间|文件名|SHA1|SHA256）：%q", i+1, line)
+			continue
+		}
+		if _, err := time.ParseInLocation(timeLayout, parts[0], time.Local); err != nil {
+			t.Errorf("第 %d 行添加时间无效：%q", i+1, parts[0])
+		}
+	}
+	s1, s256 := hashPair(dataA)
+	if rec := loaded.byName["a.txt"][0]; !rec.matches(s1, s256) {
 		t.Error("a.txt 的哈希不匹配")
 	}
 
@@ -669,6 +854,37 @@ func TestRunAddSortsDatabase(t *testing.T) {
 	}
 }
 
+func TestRunAddSortsSameNameByAddedTime(t *testing.T) {
+	root := t.TempDir()
+	data := []byte("same")
+	db := writeTestDB(t, dbLineAt("2026-11-14 22:10:00", "same.txt", data)+"\r\n"+
+		dbLineAt("2026-11-14 22:08:23", "same.txt", data)+"\r\n"+
+		dbLineAt("2026-11-14 22:09:00", "same.txt", data)+"\r\n")
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"--add", "--db", db, root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+
+	raw, err := os.ReadFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		parts := strings.Split(strings.TrimSuffix(line, "\r"), "|")
+		if len(parts) != 4 {
+			t.Fatalf("行格式不对：%q", line)
+		}
+		got = append(got, parts[0])
+	}
+	want := []string{"2026-11-14 22:08:23", "2026-11-14 22:09:00", "2026-11-14 22:10:00"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("同名记录应按添加时间排序，实际 %v，期望 %v", got, want)
+	}
+}
+
 func TestRunAddSortsExistingDBWithoutAdditions(t *testing.T) {
 	root := t.TempDir()
 	db := writeTestDB(t, dbLine("zeta.txt", []byte("z"))+"\r\n"+
@@ -727,9 +943,15 @@ func writeTestDB(t *testing.T, content string) string {
 	return p
 }
 
+const testAdded = "2026-11-14 22:08:23"
+
 func dbLine(name string, data []byte) string {
-	m5, s1, s256 := hashTriple(data)
-	return fmt.Sprintf("%s|%s|%s|%s", filepath.ToSlash(name), strings.ToUpper(m5), strings.ToUpper(s1), strings.ToUpper(s256))
+	return dbLineAt(testAdded, name, data)
+}
+
+func dbLineAt(added, name string, data []byte) string {
+	s1, s256 := hashPair(data)
+	return fmt.Sprintf("%s|%s|%s|%s", added, filepath.ToSlash(name), strings.ToUpper(s1), strings.ToUpper(s256))
 }
 
 func readDBNames(t *testing.T, p string) []string {
@@ -746,6 +968,16 @@ func readDBNames(t *testing.T, p string) []string {
 			continue
 		}
 		parts := strings.Split(line, "|")
+		if len(parts) == 4 {
+			if parts[0] == "" {
+				names = append(names, parts[1])
+				continue
+			}
+			if _, err := time.ParseInLocation(timeLayout, strings.TrimSpace(parts[0]), time.Local); err == nil {
+				names = append(names, parts[1])
+				continue
+			}
+		}
 		if len(parts) > 0 {
 			names = append(names, parts[0])
 		}

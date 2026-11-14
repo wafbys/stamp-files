@@ -24,17 +24,20 @@ const (
 	dbFileName        = "stamp-db.txt"
 )
 
-var version = "0.4.0"
+var version = "0.8.0"
 
 const usageText = `用法：
-  stamp-files [选项] [目录]
+  stamp-files [选项] [目录或模式]
 
-目录是唯一的位置参数，默认 .（当前目录），始终递归子目录。
+位置参数可以是目录，也可以是文件名通配模式，默认 .（当前目录）。
+支持 *（任意字符序列）和 ?（单个字符），不区分大小写；[ ] 按字面处理。
+通配符只作用于最后一段，目录部分必须真实存在；始终递归子目录。
 时间和数据库只用选项指定，不做位置参数。
 
-数据库格式：文件名|MD5|SHA1|SHA256
-MD5、SHA1、SHA256 任一命中即可，文件名不区分大小写。
---add 写入后按文件名（不区分大小写）排序，注释和空行保留在开头。
+数据库格式：添加时间|文件名|SHA1|SHA256
+添加时间格式 yyyy-MM-dd HH:mm:ss；旧三字段或含 MD5 的四字段仍可读，时间留空。
+SHA1、SHA256 任一命中即可，文件名不区分大小写。
+--add 写入后按文件名、再按添加时间排序；注释和空行保留在开头。
 
 打戳、将打戳标签后的掩码表示要写的时间：C=创建，M=修改；
 已经一致的位显示 -，例如 [打戳 CM]、[将打戳 -M]。
@@ -49,16 +52,19 @@ MD5、SHA1、SHA256 任一命中即可，文件名不区分大小写。
   -a, --hash-all           对所有文件计算哈希（默认只算有候选的）
       --hide-missing       不打印「未找到」明细
       --no-color           禁用颜色（也支持 NO_COLOR 环境变量）
+      --no-progress        禁用大文件读取进度（输出不是终端时自动关闭）
   -h, --help               显示帮助
   -V, --version            显示版本
 
 示例：
   stamp-files
   stamp-files D:\Archive
-  stamp-files -n D:\Archive
+  stamp-files "*.flac"
+  stamp-files "D:\Archive\*.jpg"
+  stamp-files -n "D:\Archive\*.jpg"
   stamp-files D:\Archive --time "2026-11-11 11:11:11"
   stamp-files --db D:\db.txt D:\Archive
-  stamp-files --add D:\Archive
+  stamp-files --add "*.jpg"
   stamp-files --add -n D:\Archive
   stamp-files -- -以横线开头的目录
 
@@ -66,8 +72,8 @@ MD5、SHA1、SHA256 任一命中即可，文件名不区分大小写。
 `
 
 type record struct {
+	added   time.Time
 	nameKey string
-	md5     string
 	sha1    string
 	sha256  string
 	line    int
@@ -87,6 +93,7 @@ func newDatabase() *database {
 
 type options struct {
 	dir         string
+	pattern     string
 	dirDefault  bool
 	stamp       time.Time
 	dbPath      string
@@ -95,6 +102,9 @@ type options struct {
 	hashAll     bool
 	hideMissing bool
 	noColor     bool
+	noProgress  bool
+	progress    *progressPrinter
+	started     time.Time
 	help        bool
 	version     bool
 }
@@ -166,6 +176,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	opts.started = time.Now()
+	opts.progress = newProgressPrinter(stdout, !opts.noProgress && isTerminal(stdout))
+
 	info, err := os.Stat(opts.dir)
 	if err != nil {
 		fmt.Fprintf(stderr, "错误：目录不可用：%s：%v\n", opts.dir, err)
@@ -206,6 +219,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "未指定目录，使用当前目录：%s\n", opts.dir)
 	}
 	fmt.Fprintf(stdout, "目录：%s（递归）\n", opts.dir)
+	if opts.pattern != "" {
+		fmt.Fprintf(stdout, "匹配：%s（文件名，不区分大小写）\n", opts.pattern)
+	}
 	fmt.Fprintf(stdout, "时间：%s\n", opts.stamp.Format(timeLayout))
 	fmt.Fprintf(stdout, "数据库：%s（%d 条记录）\n", opts.dbPath, db.count)
 	if opts.dryRun {
@@ -216,6 +232,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	rep := newReporter(stdout, stderr, opts.noColor)
 	sum := scan(opts, db, rep)
 	printSummary(stdout, sum, opts.dryRun)
+	fmt.Fprintf(stdout, "用时：%s\n", formatDuration(time.Since(opts.started)))
 
 	if sum.errors > 0 {
 		return 1
@@ -244,6 +261,7 @@ func parseArgs(args []string, defaultDB string) (*options, error) {
 		hashAll     bool
 		hideMissing bool
 		noColor     bool
+		noProgress  bool
 		help        bool
 		showVersion bool
 	)
@@ -254,6 +272,7 @@ func parseArgs(args []string, defaultDB string) (*options, error) {
 	fs.BoolVarP(&hashAll, "hash-all", "a", false, "对所有文件计算哈希")
 	fs.BoolVar(&hideMissing, "hide-missing", false, "不打印未找到明细")
 	fs.BoolVar(&noColor, "no-color", false, "禁用颜色")
+	fs.BoolVar(&noProgress, "no-progress", false, "禁用读取进度")
 	fs.BoolVarP(&help, "help", "h", false, "显示帮助")
 	fs.BoolVarP(&showVersion, "version", "V", false, "显示版本")
 
@@ -273,12 +292,17 @@ func parseArgs(args []string, defaultDB string) (*options, error) {
 	}
 
 	dir := "."
+	pattern := ""
 	dirDefault := true
 	if len(positional) == 1 {
 		if positional[0] == "" {
 			return nil, fmt.Errorf("目录不能为空")
 		}
-		dir = positional[0]
+		var splitErr error
+		dir, pattern, splitErr = splitPatternOperand(positional[0])
+		if splitErr != nil {
+			return nil, splitErr
+		}
 		dirDefault = false
 	}
 	if timeArg == "" {
@@ -306,6 +330,7 @@ func parseArgs(args []string, defaultDB string) (*options, error) {
 
 	return &options{
 		dir:         absDir,
+		pattern:     pattern,
 		dirDefault:  dirDefault,
 		stamp:       stamp,
 		dbPath:      absDB,
@@ -314,7 +339,77 @@ func parseArgs(args []string, defaultDB string) (*options, error) {
 		hashAll:     hashAll,
 		hideMissing: hideMissing,
 		noColor:     noColor,
+		noProgress:  noProgress,
 	}, nil
+}
+
+// splitPatternOperand 把位置参数拆成扫描根目录和文件名通配模式。
+// 支持 * 和 ?，只允许出现在最后一段；目录部分出现通配符时报错。
+func splitPatternOperand(operand string) (string, string, error) {
+	if !strings.ContainsAny(operand, "*?") {
+		return operand, "", nil
+	}
+
+	vol := filepath.VolumeName(operand)
+	rest := operand[len(vol):]
+	idx := strings.LastIndexAny(rest, `\/`)
+	if idx < 0 {
+		if vol != "" {
+			return "", "", fmt.Errorf("通配模式需要盘符后跟路径分隔符：%s", operand)
+		}
+		return ".", operand, nil
+	}
+
+	dir := operand[:len(vol)+idx]
+	pattern := rest[idx+1:]
+	if pattern == "" {
+		return "", "", fmt.Errorf("通配模式缺少文件名：%s", operand)
+	}
+	if strings.ContainsAny(dir, "*?") {
+		return "", "", fmt.Errorf("通配符只支持文件名最后一段：%s", operand)
+	}
+	if dir == "" {
+		dir = string(filepath.Separator)
+	} else if len(dir) == len(vol) {
+		// 盘符或 UNC 共享名后直接跟通配符，补回分隔符。
+		dir = operand[:len(vol)+1]
+	}
+	return dir, pattern, nil
+}
+
+// matchFileName 按 Windows 习惯做不区分大小写的通配匹配：* 任意序列，? 单个字符。
+func matchFileName(pattern, name string) bool {
+	return matchRunes([]rune(strings.ToLower(pattern)), []rune(strings.ToLower(name)))
+}
+
+func matchRunes(pattern, name []rune) bool {
+	p, n := 0, 0
+	star := -1
+	starName := 0
+	for n < len(name) {
+		if p < len(pattern) && (pattern[p] == '?' || pattern[p] == name[n]) {
+			p++
+			n++
+			continue
+		}
+		if p < len(pattern) && pattern[p] == '*' {
+			star = p
+			starName = n
+			p++
+			continue
+		}
+		if star >= 0 {
+			p = star + 1
+			starName++
+			n = starName
+			continue
+		}
+		return false
+	}
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
 }
 
 func loadDatabase(dbPath string, warn io.Writer) (*database, error) {
@@ -341,40 +436,55 @@ func loadDatabase(dbPath string, warn io.Writer) (*database, error) {
 		}
 
 		parts := strings.Split(line, "|")
-		if len(parts) != 4 {
-			db.warnf(warn, lineNo, "字段数应为 4，实际 %d，已忽略", len(parts))
+		var added time.Time
+		var namePart, sha1Part, sha256Part string
+		switch len(parts) {
+		case 3:
+			namePart, sha1Part, sha256Part = parts[0], parts[1], parts[2]
+		case 4:
+			if t, err := time.ParseInLocation(timeLayout, strings.TrimSpace(parts[0]), time.Local); err == nil {
+				// 新格式：添加时间|文件名|SHA1|SHA256
+				added = t
+				namePart, sha1Part, sha256Part = parts[1], parts[2], parts[3]
+			} else if parts[0] == "" {
+				// 添加时间留空的新格式。
+				namePart, sha1Part, sha256Part = parts[1], parts[2], parts[3]
+			} else if isHashOrEmpty(parts[1], 32) && isHashOrEmpty(parts[2], 40) && isHashOrEmpty(parts[3], 64) {
+				// 旧格式：文件名|MD5|SHA1|SHA256；MD5 列忽略。
+				namePart, sha1Part, sha256Part = parts[0], parts[2], parts[3]
+			} else {
+				db.warnf(warn, lineNo, "四字段格式无法识别（第一列不是添加时间，第二列也不是 MD5），已忽略")
+				continue
+			}
+		default:
+			db.warnf(warn, lineNo, "字段数应为 3 或 4，实际 %d，已忽略", len(parts))
 			continue
 		}
 
-		nameKey := normalizeName(parts[0])
+		nameKey := normalizeName(namePart)
 		if nameKey == "" {
 			db.warnf(warn, lineNo, "文件名为空，已忽略")
 			continue
 		}
 
-		md5v, ok := normalizeHash(parts[1], 32)
-		if !ok {
-			db.warnf(warn, lineNo, "MD5 格式无效（应为 32 位十六进制），已忽略")
-			continue
-		}
-		sha1v, ok := normalizeHash(parts[2], 40)
+		sha1v, ok := normalizeHash(sha1Part, 40)
 		if !ok {
 			db.warnf(warn, lineNo, "SHA1 格式无效（应为 40 位十六进制），已忽略")
 			continue
 		}
-		sha256v, ok := normalizeHash(parts[3], 64)
+		sha256v, ok := normalizeHash(sha256Part, 64)
 		if !ok {
 			db.warnf(warn, lineNo, "SHA256 格式无效（应为 64 位十六进制），已忽略")
 			continue
 		}
-		if md5v == "" && sha1v == "" && sha256v == "" {
-			db.warnf(warn, lineNo, "MD5、SHA1、SHA256 都为空，已忽略")
+		if sha1v == "" && sha256v == "" {
+			db.warnf(warn, lineNo, "SHA1、SHA256 都为空，已忽略")
 			continue
 		}
 
 		rec := &record{
+			added:   added,
 			nameKey: nameKey,
-			md5:     md5v,
 			sha1:    sha1v,
 			sha256:  sha256v,
 			line:    lineNo,
@@ -407,6 +517,15 @@ func normalizeHash(s string, length int) (string, bool) {
 	return s, true
 }
 
+func isHashOrEmpty(s string, length int) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true
+	}
+	_, ok := normalizeHash(s, length)
+	return ok
+}
+
 func normalizeName(p string) string {
 	p = strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
 	if p == "" {
@@ -421,17 +540,13 @@ func normalizeName(p string) string {
 	return strings.ToLower(p)
 }
 
-func (r *record) matches(md5v, sha1v, sha256v string) bool {
-	return (r.md5 != "" && strings.EqualFold(r.md5, md5v)) ||
-		(r.sha1 != "" && strings.EqualFold(r.sha1, sha1v)) ||
+func (r *record) matches(sha1v, sha256v string) bool {
+	return (r.sha1 != "" && strings.EqualFold(r.sha1, sha1v)) ||
 		(r.sha256 != "" && strings.EqualFold(r.sha256, sha256v))
 }
 
-func matchDetail(r *record, md5v, sha1v, sha256v string) string {
+func matchDetail(r *record, sha1v, sha256v string) string {
 	var parts []string
-	if r.md5 != "" && strings.EqualFold(r.md5, md5v) {
-		parts = append(parts, "MD5")
-	}
 	if r.sha1 != "" && strings.EqualFold(r.sha1, sha1v) {
 		parts = append(parts, "SHA1")
 	}
@@ -448,7 +563,7 @@ func processFile(opts *options, db *database, fullPath, rel string) fileResult {
 		return fileResult{rel: rel, status: statusNotFound}
 	}
 
-	of, err := openAndHash(fullPath)
+	of, err := openAndHash(fullPath, opts.progress)
 	if err != nil {
 		return fileResult{rel: rel, status: statusError, err: err}
 	}
@@ -460,7 +575,7 @@ func processFile(opts *options, db *database, fullPath, rel string) fileResult {
 
 	var matched []*record
 	for _, rec := range candidates {
-		if rec.matches(of.md5, of.sha1, of.sha256) {
+		if rec.matches(of.sha1, of.sha256) {
 			matched = append(matched, rec)
 		}
 	}
@@ -469,7 +584,7 @@ func processFile(opts *options, db *database, fullPath, rel string) fileResult {
 	}
 
 	rec := matched[0]
-	detail := matchDetail(rec, of.md5, of.sha1, of.sha256)
+	detail := matchDetail(rec, of.sha1, of.sha256)
 	if len(matched) > 1 {
 		detail += fmt.Sprintf("；%d 条记录命中，采用第 %d 行", len(matched), rec.line)
 	}
@@ -513,6 +628,9 @@ func scan(opts *options, db *database, rep *reporter) summary {
 			return nil
 		}
 		if d.IsDir() {
+			return nil
+		}
+		if opts.pattern != "" && !matchFileName(opts.pattern, d.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(opts.dir, p)
@@ -588,6 +706,9 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "未指定目录，使用当前目录：%s\n", opts.dir)
 	}
 	fmt.Fprintf(stdout, "目录：%s（递归）\n", opts.dir)
+	if opts.pattern != "" {
+		fmt.Fprintf(stdout, "匹配：%s（文件名，不区分大小写）\n", opts.pattern)
+	}
 	if dbExists {
 		fmt.Fprintf(stdout, "数据库：%s（%d 条记录）\n", opts.dbPath, db.count)
 	} else {
@@ -603,7 +724,7 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 	seenDB := make(map[string]bool)
 	for _, recs := range db.byName {
 		for _, rec := range recs {
-			seenDB[dedupKey(rec.nameKey, rec.md5, rec.sha1, rec.sha256)] = true
+			seenDB[dedupKey(rec.nameKey, rec.sha1, rec.sha256)] = true
 		}
 	}
 	seenScan := make(map[string]bool)
@@ -633,6 +754,9 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 		if d.IsDir() {
 			return nil
 		}
+		if opts.pattern != "" && !matchFileName(opts.pattern, d.Name()) {
+			return nil
+		}
 		rel, relErr := filepath.Rel(opts.dir, p)
 		if relErr != nil {
 			sum.errors++
@@ -651,14 +775,14 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 		}
 
 		sum.total++
-		of, err := openAndHash(p)
+		of, err := openAndHash(p, opts.progress)
 		if err != nil {
 			sum.errors++
 			rep.errorf("%s：%v", rel, err)
 			return nil
 		}
 		name := filepath.Base(rel)
-		key := dedupKey(normalizeName(name), of.md5, of.sha1, of.sha256)
+		key := dedupKey(normalizeName(name), of.sha1, of.sha256)
 		if seenDB[key] {
 			sum.existing++
 			rep.existing(rel)
@@ -674,7 +798,7 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 		seenScan[key] = true
 
 		line := fmt.Sprintf("%s|%s|%s|%s",
-			name, strings.ToUpper(of.md5), strings.ToUpper(of.sha1), strings.ToUpper(of.sha256))
+			time.Now().Format(timeLayout), name, strings.ToUpper(of.sha1), strings.ToUpper(of.sha256))
 		if opts.dryRun {
 			sum.added++
 			rep.wouldAdd(rel)
@@ -716,6 +840,7 @@ func runAdd(opts *options, stdout, stderr io.Writer) int {
 	} else {
 		fmt.Fprintln(stdout, "没有新增记录")
 	}
+	fmt.Fprintf(stdout, "用时：%s\n", formatDuration(time.Since(opts.started)))
 	return exitForErrors(sum.errors)
 }
 
@@ -800,8 +925,23 @@ func dbSortKey(line string) string {
 	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 		return ""
 	}
-	name, _, _ := strings.Cut(line, "|")
-	return normalizeName(name)
+	name, added := dbLineNameAndTime(line)
+	return normalizeName(name) + "\x00" + added
+}
+
+// dbLineNameAndTime 从一行数据库记录中取文件名和添加时间。
+// 新格式为 添加时间|文件名|SHA1|SHA256；旧三字段和含 MD5 的四字段没有时间。
+func dbLineNameAndTime(line string) (string, string) {
+	parts := strings.Split(line, "|")
+	if len(parts) == 4 {
+		if parts[0] == "" {
+			return parts[1], ""
+		}
+		if t, err := time.ParseInLocation(timeLayout, strings.TrimSpace(parts[0]), time.Local); err == nil {
+			return parts[1], t.Format(timeLayout)
+		}
+	}
+	return parts[0], ""
 }
 
 func writeFileAtomic(path string, data []byte) error {
@@ -838,8 +978,8 @@ func printAddSummary(w io.Writer, s addSummary, dryRun bool) {
 	fmt.Fprintln(w)
 }
 
-func dedupKey(nameKey, md5v, sha1v, sha256v string) string {
-	return nameKey + "|" + strings.ToUpper(md5v) + "|" + strings.ToUpper(sha1v) + "|" + strings.ToUpper(sha256v)
+func dedupKey(nameKey, sha1v, sha256v string) string {
+	return nameKey + "|" + strings.ToUpper(sha1v) + "|" + strings.ToUpper(sha256v)
 }
 
 type dbAppender struct {
@@ -932,12 +1072,7 @@ func useColor(w io.Writer, noColor bool) bool {
 	if noColor || os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
 		return false
 	}
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return isTerminal(w)
 }
 
 func (r *reporter) paint(color bool, code, text string) string {
